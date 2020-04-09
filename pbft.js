@@ -232,6 +232,12 @@ pbft.server = function(id, peers) {
     // prePreparedMessageProofs: {},
     // checkpointProof: {},
 
+    /* Implies if the server has been compromised and is a Byzantine server.
+     * Under such scenario the server will replace all message contents with
+     * its own `byzantineSecret` string */
+    isInByzantineMode: false,
+    byzantineSecret: "b",
+
     //fields for client
     latestPrime: 0,
     clientMulticastTimer: util.Inf,
@@ -306,6 +312,16 @@ var hashCode = function(m) {
   return hash.toString(); // We work with strings throughout to make things easier.
 }
 
+/* Returns the original message or a byzantine version if server
+ * has `isInByzantineMode` set to true */
+var checkAndGetMessage = function(server, message) {
+  var sequence = message.split(':')[1];
+  if (server.isInByzantineMode) {
+    message = server.byzantineSecret + ':' + sequence;
+  }
+  return message;
+}
+
 rules.sendPrePrepare = function(model, server, peer) {
   server.clientMessagesToSend[server.view] = server.clientMessagesToSend[server.view] || makePeerArrays();
   server.prePrepareRequestsSent[server.view] = server.prePrepareRequestsSent[server.view] || {};
@@ -315,13 +331,25 @@ rules.sendPrePrepare = function(model, server, peer) {
   if ((server.id == (server.view % NUM_SERVERS)) &&
       (server.clientMessagesToSend[server.view][peer].length !== 0) &&
       (server.prePrepareRequestsSent[server.view][server.lastUsedSequenceNumber][peer].length === 0)) {
-    var message = server.clientMessagesToSend[server.view][peer][0];
+    var message = checkAndGetMessage(server, server.clientMessagesToSend[server.view][peer][0]);
     var request = {
       from: server.id,
       to: peer,
       type: MESSAGE_TYPE.PRE_PREPARE,
       v: server.view,
       n: server.lastUsedSequenceNumber,
+      /* Indicator of whether the pre-prepare message has a valid client signature.
+       * In Byzantine mode, the server will rewrite the value of the message with the
+       * character 'b', and overwrite the digest, before sending the pre-prepare.
+       * In doing this, assuming the server cannot subvert the cryptographic
+       * techniques used, the client signature which was attached to the original
+       * message (see section 4.2 of the PBFT paper, http://pmg.csail.mit.edu/papers/osdi99.pdf)
+       * becomes invalid for the rewritten message contents in the pre-prepare.
+       * Instead of computing signatures using real keys, the he flag
+       * `hasValidClientSignature` indicates this condition for demonstration
+       * purposes, and is used to check later whether a server should accept a
+       * pre-prepare message (see handlePrePrepareRequest). */
+      hasValidClientSignature: !server.isInByzantineMode,
       /* Digest of the message which is part of the validation on receiver. */
       d: hashCode(message),
       /* The message content is sent at the same time as the pre-prepare. */
@@ -343,7 +371,7 @@ var handlePrePrepareRequest = function(model, server, request) {
                 Expecting: ${hashCode(request.m)}; Got: ${request.d}.`);
     return;
   }
-  if (!request.authentic && request.from !== server.id) {
+  if ((!request.authentic || !request.hasValidClientSignature) && !server.isInByzantineMode && request.from !== server.id) {
     console.log(`Preprepare request ${request} from unathenticated source rejected.`);
     return;
   }
@@ -361,6 +389,16 @@ var handlePrePrepareRequest = function(model, server, request) {
   }
 
   server.acceptedPrePrepares[request.v][request.n].push(request);
+  var msg = request.v + "," + request.n + "," + request.m;
+  server.log.push({v: request.v, n: request.n, m: msg, status: "pre-prepared"});
+  server.log.sort((a, b) => {
+    // Order log messages by (v, n) tuple
+    if (a.v == b.v) {
+      return a.n - b.n;
+    } else {
+      return a.v - b.v;
+    }
+  });
 };
 
 rules.sendPrepares = function(model, server, peer) {
@@ -405,7 +443,7 @@ var extractLatestMessage = function(server, v, n) {
       !(0 in server.acceptedPrePrepares[v][n])) {
     return null;
   }
-  return server.acceptedPrePrepares[v][n][0].m;
+  return checkAndGetMessage(server, server.acceptedPrePrepares[v][n][0].m);
 }
 
 var handlePrepareRequest = function(model, server, request) {
@@ -423,8 +461,8 @@ var handlePrepareRequest = function(model, server, request) {
                 Expecting: ${hashCode(msg)}; Got: ${request.d}.`);
     return;
   }
-  if (!request.authentic && request.from !== server.id) {
-    console.log(`Preprepare request ${request} from unathenticated source rejected.`);
+  if (!request.authentic && !server.isInByzantineMode && request.from !== server.id) {
+    console.log(`Prepare request ${request} from unathenticated source rejected.`);
     return;
   }
 
@@ -464,6 +502,13 @@ rules.startCommit = function(model, server) {
         (server.preparedMessagesToCommit[server.view][n].length == 0)) {
       var requestToCommit = getFirstRequest(requests)[0];
       server.preparedMessagesToCommit[server.view][n].push(requestToCommit);
+      server.log.forEach(function(entry) {
+        if (entry.v === requestToCommit.v && n == requestToCommit.n) {
+          if (entry.status == "pre-prepared") {
+            entry.status = "prepared"
+          }
+        }
+      });
     }
   }
 };
@@ -509,7 +554,7 @@ var handleCommitRequest = function(model, server, request) {
                 Expecting: ${hashCode(msg)}; Got: ${request.d}.`);
     return;
   }
-  if (!request.authentic && request.from !== server.id) {
+  if (!request.authentic && !server.isInByzantineMode && request.from !== server.id) {
     console.log(`Preprepare request ${request} from unathenticated source rejected.`);
     return;
   }
@@ -596,16 +641,12 @@ rules.addCommitsToLog = function(model, server) {
         }
       }
 
-      var msg = rq.v + "," + rq.n + "," + m;
-      server.log.push({v: rq.v, n: rq.n, m: msg});
-      server.log.sort((a, b) => {
-        // Order log messages by (v, n) tuple
-        if (a.v == b.v) {
-          return a.n - b.n;
-        } else {
-          return a.v - b.v;
+      server.log.forEach(function(entry) {
+        if (entry.v === rq.v && entry.n == rq.n) {
+          entry.status = "committed"
         }
       });
+      var msg = rq.v + "," + rq.n + "," + m;
       server.pushedLogMessages[server.view][n].push(msg);
 
       var reply = {
@@ -758,7 +799,7 @@ rules.sendNewView = function(model, server, peer) {
 };
 
 var handleNewViewRequest = function(model, server, request) {
-  if (!request.authentic && request.from !== server.id) {
+  if (!request.authentic && !server.isInByzantineMode && request.from !== server.id) {
     return;
   }
 
@@ -814,6 +855,10 @@ var handleClientRequestRequest = function(model, server, request) {
    * or checkpoint when view changing. */
   if (server.state.CHANGING_VIEW) {
     return;
+  }
+
+  if (server.isInByzantineMode) {
+    request.value = server.byzantineSecret;
   }
 
   var clientRequestContents = request.value + ":" + request.timestamp;
@@ -1033,6 +1078,11 @@ pbft.becomeAuthentic = function(model, server) {
   pbft.reset(model, server);
 }
 
+/* Changes if server is in byzantine mode. */
+pbft.byzantineMode = function(model, server) {
+  server.isInByzantineMode =! server.isInByzantineMode;
+}
+
 pbft.clientRequest = function(model) {
   var client = util.pbftGetClient(model);
   //send msg(type,msg,time) + start timer
@@ -1216,6 +1266,7 @@ var serverActions = [
   ['request', pbft.clientRequest],
   ['invalidate authenticity', pbft.invalidateAuthenticity],
   ['become authentic', pbft.becomeAuthentic],
+  ['byzantine mode', pbft.byzantineMode],
 ];
 
 var messageActions = [
@@ -1260,6 +1311,7 @@ var serverModal = function(model, server) {
       .append(li('currentView', server.view))
       .append(li('lastUsedSequenceNumber', server.lastUsedSequenceNumber))
       .append(li('viewChangeAlarm', util.relTime(server.viewChangeAlarm, model.time)))
+      .append(li('byzantineMode', server.isInByzantineMode))
       .append($('<dt>peers</dt>'))
       .append($('<dd></dd>').append(peerTable))
     );
@@ -1428,7 +1480,7 @@ pbft.render.servers = function(serversSame, svg) {
       var serverFill;
       if (server.state == NODE_STATE.CRASHED) {
         serverFill = 'grey';
-      } else if (!server.authentic) {
+      } else if (!server.authentic || server.isInByzantineMode) {
         serverFill = '#c76561';
       } else {
         serverFill = viewColors[server.view % viewColors.length];
@@ -1498,12 +1550,14 @@ pbft.appendServerInfo = function(state, svg) {
 }
 
 // Public function.
-pbft.render.entry = function(spec, entry, committed) {
+pbft.render.entry = function(spec, entry) {
+  var prepared = entry.status == 'prepared';
+  var committed = entry.status == 'committed';
   return util.SVG('g')
-    .attr('class', 'entry ' + (committed ? 'committed' : 'uncommitted'))
+    .attr('class', 'entry ' + ( committed ? 'committed' : 'uncommitted'))
     .append(util.SVG('rect')
       .attr(spec)
-      .attr('stroke-dasharray', committed ? '1 0' : '5 5')
+      .attr('stroke-dasharray', committed ? '1 0' : prepared ? '5 5' : '0 1')
       .attr('style', 'fill: ' + viewColors[entry.v % viewColors.length]))
     .append(util.SVG('text')
       .attr({x: spec.x + spec.width / 2,
@@ -1598,8 +1652,7 @@ pbft.render.logs = function(svg, model) {
       var index = i + 1;
         log.append(pbft.render.entry(
              logEntrySpec(index),
-             entry,
-             index <= server.lastUsedSequenceNumber));
+             entry));
     });
     if (leader !== null && leader != server) {
       // log.append(
